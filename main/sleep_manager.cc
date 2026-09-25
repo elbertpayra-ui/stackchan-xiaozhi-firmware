@@ -9,6 +9,7 @@
 #include <esp_vfs_fat.h>
 #include <sdmmc_cmd.h>
 #include <driver/sdmmc_host.h>
+#include <driver/spi_common.h>
 #include <algorithm>
 #include <stdio.h>
 #include <dirent.h>
@@ -98,29 +99,43 @@ bool SleepManager::MountSdCard() {
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
     slot_config.clk = GPIO_NUM_11;
     slot_config.cmd = GPIO_NUM_13;
-    slot_config.D0 = GPIO_NUM_10;
+    slot_config.d0 = GPIO_NUM_10;
+    slot_config.width = 1;
 
     esp_err_t ret = esp_vfs_fat_sdmmc_mount(SD_MOUNT_POINT, &host, &slot_config, &mount_config, &card);
 
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "SD card mounted (SDMMC mode)");
+        sd_card_ = card;
         return true;
     }
 
     ESP_LOGW(TAG, "SDMMC mount failed (%s), trying SPI", esp_err_to_name(ret));
 
-    // Try SPI mode
-    sdmmc_host_t spi_host = SDSPI_HOST_DEFAULT();
-    sdspi_device_config_t spi_slot = SDSPI_DEVICE_CONFIG_DEFAULT();
-    spi_slot.clk = GPIO_NUM_11;
-    spi_slot.mosi = GPIO_NUM_13;
-    spi_slot.miso = GPIO_NUM_12;
-    spi_slot.spics_io_num = GPIO_NUM_10;
+    // Try SPI mode — ESP-IDF v5.5.2 uses spi_bus_initialize + sdspi_host_init_device
+    spi_bus_config_t buscfg = {};
+    buscfg.sclk_io_num = GPIO_NUM_11;
+    buscfg.mosi_io_num = GPIO_NUM_13;
+    buscfg.miso_io_num = GPIO_NUM_12;
+    buscfg.max_transfer_sz = 4060;
+    esp_err_t ret_spi = spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    if (ret_spi != ESP_OK) {
+        ESP_LOGW(TAG, "SPI bus init failed: %s", esp_err_to_name(ret_spi));
+    }
 
-    ret = esp_vfs_fat_sdspi_mount(SD_MOUNT_POINT, &spi_host, &spi_slot, &mount_config, &card);
+    sdspi_device_config_t spi_slot = SDSPI_DEVICE_CONFIG_DEFAULT();
+    spi_slot.gpio_cs = GPIO_NUM_10;
+    spi_slot.gpio_cd = SDSPI_SLOT_NO_CD;
+    spi_slot.gpio_wp = SDSPI_SLOT_NO_WP;
+
+    sdmmc_card_t* spi_card = nullptr;
+    sdmmc_host_t spi_host = SDSPI_HOST_DEFAULT();
+
+    ret = esp_vfs_fat_sdmmc_mount(SD_MOUNT_POINT, &spi_host, &spi_slot, &mount_config, &spi_card);
 
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "SD card mounted (SPI mode)");
+        sd_card_ = spi_card;
         return true;
     }
 
@@ -129,13 +144,14 @@ bool SleepManager::MountSdCard() {
 }
 
 void SleepManager::UnmountSdCard() {
-    if (sd_card_mounted_) {
-        esp_vfs_fat_sdmmc_unmount(SD_MOUNT_POINT);
+    if (sd_card_) {
+        esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, sd_card_);
+        sd_card_ = nullptr;
         sd_card_mounted_ = false;
     }
 }
 
-bool SleepManager::EnsureDir(const std::string& path) {
+bool SleepManager::EnsureDir(const std::string& path) const {
     struct stat st;
     if (stat(path.c_str(), &st) == 0) {
         return S_ISDIR(st.st_mode);
@@ -146,12 +162,12 @@ bool SleepManager::EnsureDir(const std::string& path) {
     return false;
 }
 
-bool SleepManager::FileExists(const std::string& path) {
+bool SleepManager::FileExists(const std::string& path) const {
     struct stat st;
     return stat(path.c_str(), &st) == 0;
 }
 
-std::string SleepManager::ReadFile(const std::string& path) {
+std::string SleepManager::ReadFile(const std::string& path) const {
     FILE* f = fopen(path.c_str(), "r");
     if (!f) return "";
     std::string content;

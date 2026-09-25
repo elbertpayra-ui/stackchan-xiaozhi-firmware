@@ -104,7 +104,7 @@ int Tiredness::GetTiredness() {
 
     // Compute sunrise/sunset for today
     int year, month, day;
-    DateFromDays(DaysSinceEpoch(now / 86400), year, month, day);
+    DateFromDays((int)(now / 86400), year, month, day);
 
     float sunrise = CalculateSunriseHour((float)latitude_, (float)longitude_, year, month, day);
     float sunset = CalculateSunsetHour((float)latitude_, (float)longitude_, year, month, day);

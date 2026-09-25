@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <functional>
 #include "tiredness.h"
+#include <esp_vfs_fat.h>
+#include <sdmmc_cmd.h>
 
 struct DreamFragment {
     std::string text;
@@ -35,6 +37,7 @@ public:
     // minutes=0 means sleep indefinitely until "wake up" command
     void EnterManualSleep(int minutes);
     void ExitManualSleep();
+    void RegisterMcpTools();
 
     // Returns true if currently in manual sleep mode
     bool IsSleeping() const { return sleeping_; }
@@ -59,12 +62,12 @@ private:
     // SD card helpers
     bool MountSdCard();
     void UnmountSdCard();
-    std::string ReadFile(const std::string& path);
+    std::string ReadFile(const std::string& path) const;
     bool WriteFile(const std::string& path, const std::string& content);
     bool WriteBinaryFile(const std::string& path, const std::vector<uint8_t>& data);
     std::vector<uint8_t> ReadBinaryFile(const std::string& path);
-    bool FileExists(const std::string& path);
-    bool EnsureDir(const std::string& path);
+    bool FileExists(const std::string& path) const;
+    bool EnsureDir(const std::string& path) const;
 
     // Dream generation helpers
     std::string GenerateDreamFragment();
@@ -73,6 +76,7 @@ private:
     // State
     bool initialized_ = false;
     bool sd_card_mounted_ = false;
+    sdmmc_card_t* sd_card_ = nullptr;
     bool sleeping_ = false;
     int64_t sleep_until_ = 0;  // unix timestamp to wake, 0 = no auto-wake
     int manual_sleep_minutes_ = 0;

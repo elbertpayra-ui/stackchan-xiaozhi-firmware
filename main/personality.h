@@ -34,7 +34,7 @@ public:
     }};
 
     static const PersonalityAttributes& GetCurrent() {
-        return PERSONALITIES(current_index_);
+        return PERSONALITIES[current_index_];
     }
 
     static void SetCurrent(int index) {
