@@ -22,7 +22,7 @@ struct PersonalityAttributes {
 
 class Personality {
 public:
-    static constexpr std::array<PersonalityAttributes, 4> PERSONALITIES = {{
+    static constexpr std::array<PersonalityAttributes, 5> PERSONALITIES = {{
         {"Energetic", -45, 45, 35, 255, 180, 0, 80, 80,
          "wide scanning, vibrant LEDs, big enthusiastic nods"},
         {"Calm", -20, 20, 35, 60, 35, 10, 30, 30,
@@ -31,6 +31,8 @@ public:
          "wide scanning, colorful LEDs, frequent playful nods"},
         {"Serious", -15, 15, 35, 80, 80, 80, 40, 40,
          "minimal scanning, neutral gray LEDs, formal demeanor"},
+        {"K-Stack", -25, 25, 35, 0, 120, 255, 50, 50,
+         "focused scanning, blue LEDs, precise purposeful movements"},
     }};
 
     static const PersonalityAttributes& GetCurrent() {
