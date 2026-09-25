@@ -8,6 +8,8 @@
 #include "axp2101.h"
 #include "mcp_server.h"
 #include "notify_http_server.h"
+#include "personality.h"
+#include "sleep_manager.h"
 
 #include <esp_log.h>
 #include <esp_heap_caps.h>
@@ -19,6 +21,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "esp_video.h"
 #include "lvgl.h"
 #include "SCSCL.h"
@@ -128,6 +131,10 @@ public:
 
 private:
     static void IdleScanCb(void* arg) {
+        // Skip scanning during sleep
+        if (SleepManager::GetInstance().IsSleeping()) {
+            return;
+        }
         auto* self = static_cast<StackChanServo*>(arg);
         int yaw = (rand() % 51) - 25;
         int pitch = 25 + (rand() % 11);
@@ -1120,6 +1127,13 @@ public:
     void SetChatMessage(const char* role, const char* content) override {
         SpiLcdDisplay::SetChatMessage(role, content);
         DisplayLockGuard lock(this);
+
+        // Collect conversation snippets for dream generation
+        if (role && content && content[0] != '\0' &&
+            (strcmp(role, "user") == 0 || strcmp(role, "assistant") == 0)) {
+            SleepManager::GetInstance().AddConversationSnippet(
+                std::string(role), std::string(content));
+        }
         if (!avatar_.IsReady()) return;
         bool meaningful = role && content && content[0] != '\0'
             && (strcmp(role, "user") == 0 || strcmp(role, "assistant") == 0);
@@ -1160,6 +1174,36 @@ public:
             SetActiveLocked(true);
             BumpIdleTimerLocked();
         }
+    }
+
+    void ShowDream(const char* dream_text, int duration_ms) {
+        SpiLcdDisplay::SetChatMessage("system", dream_text);
+        SetEmotion("sleepy");
+
+        static esp_timer_handle_t dream_timer_ = nullptr;
+        if (dream_timer_) {
+            esp_timer_stop(dream_timer_);
+            esp_timer_delete(dream_timer_);
+            dream_timer_ = nullptr;
+        }
+
+        esp_timer_create_args_t args = {};
+        args.callback = [](void* arg) {
+            Application& app = Application::GetInstance();
+            app.Schedule([]() {
+                auto* disp = Board::GetInstance().GetDisplay();
+                if (disp) {
+                    disp->SetEmotion("neutral");
+                    disp->SetChatMessage("system", "");
+                }
+            });
+        };
+        args.arg = this;
+        args.dispatch_method = ESP_TIMER_TASK;
+        args.name = "dream_show";
+        args.skip_unhandled_events = true;
+        esp_timer_create(&args, &dream_timer_);
+        esp_timer_start_once(dream_timer_, duration_ms * 1000);
     }
 
 private:
@@ -1348,6 +1392,10 @@ private:
     FaceTracker face_tracker_;
     esp_timer_handle_t touchpad_timer_;
     esp_timer_handle_t batt_timer_ = nullptr;
+    esp_timer_handle_t sleep_tick_timer_ = nullptr;
+    esp_timer_handle_t breathing_timer_ = nullptr;
+    TaskHandle_t snoring_task_ = nullptr;
+    bool snoring_active_ = false;
     PowerSaveTimer* power_save_timer_;
     NotifyHttpServer* notify_http_server_ = nullptr;
     bool py32_found_ = false;
@@ -1583,6 +1631,10 @@ private:
     void UpdateLedsFromEmotion(const char* emotion) {
         if (!py32_dev_) return;
         if (led_manual_) return;
+        // Skip attribute computation during sleep
+        if (!Personality::AreAttributesActive()) {
+            return;
+        }
         uint8_t r, g, b;
         if (!emotion) { r=60; g=35; b=10; }
         else if (!strcmp(emotion, "happy") || !strcmp(emotion, "laughing") || !strcmp(emotion, "funny")) { r=255; g=180; b=0; }
@@ -1906,6 +1958,236 @@ private:
                 ESP_LOGI(TAG, "MCP notify dismiss");
                 return true;
             });
+    }
+
+    void RegisterSleepMcpTools() {
+        auto& sleep_mgr = SleepManager::GetInstance();
+
+        sleep_mgr.OnEnterManualSleep([this](int minutes) {
+            GetDisplay()->SetEmotion("sleepy");
+            GetDisplay()->SetPowerSaveMode(true);
+            GetBacklight()->SetBrightness(0);
+            servo_.PauseScan();
+            if (py32_dev_) {
+                uint16_t dim[12];
+                uint16_t dim_color = Rgb888To565(10, 5, 30);
+                for (int i = 0; i < 12; i++) dim[i] = dim_color;
+                Py32SetLedFrame(dim, 12);
+            }
+
+            // Start snoring sound
+            snoring_active_ = true;
+            if (snoring_task_ == nullptr) {
+                xTaskCreatePinnedToCore(SnoringTaskFunc, "snoring", 4096, this, 1, &snoring_task_, 1);
+            }
+
+            // Start breathing servo timer (slow pitch oscillation ~6s cycle)
+            if (breathing_timer_ == nullptr) {
+                esp_timer_create_args_t bt_args = {};
+                bt_args.callback = [](void* arg) {
+                    static_cast<M5StackCoreS3Board*>(arg)->BreathingTimerCb();
+                };
+                bt_args.arg = this;
+                bt_args.dispatch_method = ESP_TIMER_TASK;
+                bt_args.name = "breathing";
+                bt_args.skip_unhandled_events = true;
+                esp_timer_create(&bt_args, &breathing_timer_);
+            }
+            esp_timer_start_periodic(breathing_timer_, 500000);
+
+            ESP_LOGI(TAG, "Manual sleep entered (%d min)", minutes);
+        });
+
+        sleep_mgr.OnExitSleep([this]() {
+            // Stop snoring
+            snoring_active_ = false;
+            if (snoring_task_) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+                if (snoring_task_) {
+                    vTaskDelete(snoring_task_);
+                    snoring_task_ = nullptr;
+                }
+            }
+
+            // Stop breathing
+            if (breathing_timer_) {
+                esp_timer_stop(breathing_timer_);
+            }
+
+            GetDisplay()->SetEmotion("neutral");
+            GetDisplay()->SetPowerSaveMode(false);
+            GetBacklight()->RestoreBrightness();
+            servo_.Center();
+            servo_.ResumeScan();
+            if (py32_dev_) {
+                const auto& p = Personality::GetCurrent();
+                uint16_t color = Rgb888To565(p.led_neutral_r, p.led_neutral_g, p.led_neutral_b);
+                uint16_t colors[12];
+                for (int i = 0; i < 12; i++) colors[i] = color;
+                Py32SetLedFrame(colors, 12);
+            }
+            ESP_LOGI(TAG, "Manual sleep exited");
+        });
+
+        sleep_mgr.RegisterMcpTools();
+    }
+
+    void RegisterPersonalityMcpTools() {
+        auto& mcp = McpServer::GetInstance();
+
+        mcp.AddTool("self.personality.list",
+            "List all available personalities with their characteristics.",
+            PropertyList(),
+            [](const PropertyList&) -> ReturnValue {
+                std::string result = "[";
+                for (int i = 0; i < Personality::GetCount(); i++) {
+                    const auto& attrs = Personality::PERSONALITIES[i];
+                    if (i > 0) result += ",";
+                    result += "{\"index\":" + std::to_string(i) +
+                              ",\"name\":\"" + attrs.name + "\"" +
+                              ",\"description\":\"" + attrs.description + "\"}";
+                }
+                result += "]";
+                return result;
+            });
+
+        mcp.AddTool("self.personality.set",
+            "Switch the robot's personality. Args: index (0-based, check self.personality.list first).",
+            PropertyList({
+                Property("index", kPropertyTypeInteger, 0, 0, 3)
+            }),
+            [](const PropertyList& props) -> ReturnValue {
+                int index = props["index"].value<int>();
+                Personality::SetCurrent(index);
+                const auto& p = Personality::GetCurrent();
+                return std::string("Personality set to " + std::string(p.name) + ": " + p.description);
+            });
+
+        mcp.AddTool("self.personality.get",
+            "Get the current personality name and stats.",
+            PropertyList(),
+            [](const PropertyList&) -> ReturnValue {
+                std::string result = "{\"name\":\"" + std::string(Personality::GetName()) + "\"" +
+                    ",\"interactions\":" + std::to_string(Personality::GetInteractions()) +
+                    ",\"curiosity\":" + std::to_string(Personality::GetCuriosity()) +
+                    ",\"curiosity_label\":\"" + Personality::GetCuriosityLabel() + "\"" +
+                    ",\"interests_count\":" + std::to_string(Personality::GetInterests().size()) +
+                    ",\"attributes_active\":" + (Personality::AreAttributesActive() ? "true" : "false") + "}";
+                return result;
+            });
+
+        mcp.AddTool("self.dream.recall",
+            "Retrieve dream fragments from the last sleep session. Returns the most recent dreams.",
+            PropertyList(),
+            [](const PropertyList&) -> ReturnValue {
+                auto dreams = SleepManager::GetInstance().GetDreams();
+                if (dreams.empty()) {
+                    return std::string("I didn't dream anything... or maybe the dream eluded me like morning mist.");
+                }
+
+                size_t start = dreams.size() > 5 ? dreams.size() - 5 : 0;
+                cJSON* arr = cJSON_CreateArray();
+                for (size_t i = start; i < dreams.size(); i++) {
+                    cJSON* obj = cJSON_CreateObject();
+                    cJSON_AddStringToObject(obj, "text", dreams[i].text.c_str());
+                    cJSON_AddNumberToObject(obj, "timestamp", (double)dreams[i].timestamp);
+                    cJSON_AddItemToArray(arr, obj);
+                }
+
+                char* json_str = cJSON_PrintUnformatted(arr);
+                std::string result(json_str);
+                free(json_str);
+                cJSON_Delete(arr);
+                return result;
+            });
+
+        mcp.AddTool("self.dream.display",
+            "Display a dream fragment for 8 seconds on the screen. "
+            "Shows the most recent dream with a thematic background.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                auto dreams = SleepManager::GetInstance().GetDreams();
+                if (dreams.empty()) {
+                    return false;
+                }
+
+                const auto& latest = dreams.back();
+                std::string dream_text = latest.text;
+
+                auto* display = GetDisplay();
+                if (!display) return false;
+
+                Application::GetInstance().Schedule([this, dream_text]() {
+                    auto* disp = static_cast<M5StackAvatarDisplay*>(GetDisplay());
+                    if (disp) {
+                        disp->ShowDream(dream_text.c_str(), 8000);
+                    }
+                });
+
+                return true;
+            });
+    }
+
+    static void SnoringTaskFunc(void* arg) {
+        auto* board = static_cast<M5StackCoreS3Board*>(arg);
+        AudioCodec* codec = board->GetAudioCodec();
+        if (!codec) {
+            vTaskDelete(nullptr);
+            return;
+        }
+
+        codec->EnableOutput(true);
+
+        const float sample_rate = 24000.0f;
+        const int frame_size = 480;  // 20ms
+        float rumble_phase = 0.0f;
+        float breath_phase = 0.0f;
+
+        while (board->snoring_active_) {
+            std::vector<int16_t> buffer(frame_size);
+            for (int i = 0; i < frame_size; i++) {
+                // Breathing envelope (0.08 Hz = ~12.5s cycle)
+                float envelope = (1.0f + sinf(breath_phase)) * 0.5f;
+                breath_phase += 2.0f * M_PI * 0.08f / sample_rate;
+                if (breath_phase > 2.0f * M_PI) breath_phase -= 2.0f * M_PI;
+
+                // Low rumble (100 Hz)
+                float rumble = sinf(rumble_phase) * 0.4f;
+                rumble_phase += 2.0f * M_PI * 100.0f / sample_rate;
+                if (rumble_phase > 2.0f * M_PI) rumble_phase -= 2.0f * M_PI;
+
+                // Occasional snore bursts
+                float snore = sinf(rumble_phase * 0.6f) * 0.3f * envelope;
+
+                // Soft noise
+                float noise = ((float)(esp_random() % 256) / 128.0f - 1.0f) * 0.1f;
+
+                float sample = (rumble + snore + noise) * envelope * 0.12f;
+                buffer[i] = (int16_t)(sample * 32767);
+            }
+
+            codec->OutputData(buffer);
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+
+        // Silence
+        std::vector<int16_t> silence(frame_size, 0);
+        codec->OutputData(silence);
+        codec->EnableOutput(false);
+        board->snoring_task_ = nullptr;
+        vTaskDelete(nullptr);
+    }
+
+    void BreathingTimerCb() {
+        if (!SleepManager::GetInstance().IsSleeping()) return;
+        if (!servo_ok_) return;
+
+        // Gentle 6-second breathing cycle: pitch oscillates ±3 degrees around 30
+        int64_t now = esp_timer_get_time();
+        float t = (float)(now % 6000000) / 6000000.0f * 2.0f * M_PI;
+        float pitch_offset = sinf(t) * 3.0f;
+        int target_pitch = 30 + (int)pitch_offset;
+        servo_.MoveTo(0, target_pitch, 500);
     }
 
     void InitializePowerSaveTimer() {
@@ -2371,7 +2653,37 @@ public:
         InitializeFt6336TouchPad();
         InitializeBmi270();
         InitializeSi12T();
-        // Morning greeting + weather timer task removed; no-op call removed too
+
+        // Initialize personality system
+        Personality::Load();
+
+        // Initialize sleep manager with board callbacks
+        SleepManager::GetInstance().Initialize();
+        RegisterSleepMcpTools();
+        RegisterPersonalityMcpTools();
+
+        // Sleep tick timer — checks sleep status every second
+        esp_timer_create_args_t sleep_tick_args = {};
+        sleep_tick_args.callback = [](void* arg) {
+            M5StackCoreS3Board* board = static_cast<M5StackCoreS3Board*>(arg);
+            SleepManager::GetInstance().OnTick();
+            // Gate attribute computation on sleep state
+            if (SleepManager::GetInstance().IsSleeping()) {
+                Personality::SetAttributesActive(false);
+            } else if (!Personality::AreAttributesActive()) {
+                // Only re-enable if tiredness is not keeping it off
+                int tiredness = SleepManager::GetInstance().GetTiredness().GetTiredness();
+                if (tiredness < 80) {
+                    Personality::SetAttributesActive(true);
+                }
+            }
+        };
+        sleep_tick_args.arg = this;
+        sleep_tick_args.dispatch_method = ESP_TIMER_TASK;
+        sleep_tick_args.name = "sleep_tick";
+        sleep_tick_args.skip_unhandled_events = true;
+        ESP_ERROR_CHECK(esp_timer_create(&sleep_tick_args, &sleep_tick_timer_));
+        ESP_ERROR_CHECK(esp_timer_start_periodic(sleep_tick_timer_, 1000000));
 
         esp_timer_create_args_t status_args = {};
         status_args.callback = [](void* arg) {
